@@ -1,0 +1,145 @@
+name: Private TestFlight build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: presence-pair-testflight
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate private build inputs
+        env:
+          SOURCE_ARCHIVE_PASSWORD: ${{ secrets.SOURCE_ARCHIVE_PASSWORD }}
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          APPLE_PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_BASE64 }}
+          PROVISIONING_PROFILE_NAME: ${{ secrets.PROVISIONING_PROFILE_NAME }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+        run: |
+          missing=""
+          for variable in \
+            SOURCE_ARCHIVE_PASSWORD \
+            APPLE_CERTIFICATE_BASE64 \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_KEYCHAIN_PASSWORD \
+            APPLE_PROFILE_BASE64 \
+            PROVISIONING_PROFILE_NAME \
+            ASC_KEY_ID \
+            ASC_ISSUER_ID \
+            ASC_PRIVATE_KEY_BASE64; do
+            if [[ -z "${!variable:-}" ]]; then
+              missing="${missing} ${variable}"
+            fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "Missing repository secrets:${missing}" >&2
+            exit 1
+          fi
+          test -s source.enc
+
+      - name: Decrypt source in runner temp
+        env:
+          SOURCE_ARCHIVE_PASSWORD: ${{ secrets.SOURCE_ARCHIVE_PASSWORD }}
+        run: |
+          source_root="$GITHUB_WORKSPACE/.private-source"
+          source_zip="$RUNNER_TEMP/presence-pair-source.zip"
+          mkdir -p "$source_root"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in source.enc \
+            -out "$source_zip" \
+            -pass env:SOURCE_ARCHIVE_PASSWORD
+          ditto -x -k "$source_zip" "$source_root"
+          rm -f "$source_zip"
+          test -s "$source_root/project.yml"
+
+      - name: Verify current App Store SDK
+        run: |
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $sdk_version"
+          if [[ "${sdk_version%%.*}" -lt 26 ]]; then
+            echo "The App Store build requires the iOS 26 SDK or later." >&2
+            exit 1
+          fi
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: .private-source
+
+      - name: Generate and test project
+        working-directory: .private-source
+        run: |
+          xcodegen generate
+          xcodebuild \
+            -project PresencePair.xcodeproj \
+            -scheme PresencePair \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 16 Pro' \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Import signing identity and profile
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPLE_PROFILE_BASE64 }}
+        run: |
+          certificate_path="$RUNNER_TEMP/distribution.p12"
+          profile_path="$RUNNER_TEMP/profile.mobileprovision"
+          keychain_path="$RUNNER_TEMP/presence-pair.keychain-db"
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode -o "$certificate_path"
+          echo -n "$PROFILE_BASE64" | base64 --decode -o "$profile_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$keychain_path"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$profile_path" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+
+      - name: Choose unique TestFlight build number
+        run: echo "BUILD_NUMBER=$((200 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+
+      - name: Build and upload internal TestFlight binary
+        working-directory: .private-source
+        env:
+          APPLE_TEAM_ID: M2YT875N26
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+          PROVISIONING_PROFILE_NAME: ${{ secrets.PROVISIONING_PROFILE_NAME }}
+        run: bundle exec fastlane ios beta
+
+      - name: Remove decrypted material
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/.private-source"
+          rm -f \
+            "$RUNNER_TEMP/presence-pair-source.zip" \
+            "$RUNNER_TEMP/distribution.p12" \
+            "$RUNNER_TEMP/profile.mobileprovision"
+          security delete-keychain "$RUNNER_TEMP/presence-pair.keychain-db" 2>/dev/null || true
