@@ -91,7 +91,7 @@ jobs:
           xcodebuild \
             -project PresencePair.xcodeproj \
             -scheme PresencePair \
-            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 16 Pro' \
+            -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17 Pro' \
             CODE_SIGNING_ALLOWED=NO \
             test
 
