@@ -1,0 +1,38 @@
+name: Configure internal TestFlight build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: App Store Connect build number
+        required: true
+        default: "202"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: presence-pair-testflight-configuration
+  cancel-in-progress: false
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Wait for processing and configure internal testing
+        env:
+          ASC_APP_ID: "6808059201"
+          ASC_BUILD_NUMBER: ${{ inputs.build_number }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.ASC_PRIVATE_KEY_BASE64 }}
+          TESTFLIGHT_GROUP_NAME: "Presence Pair Internal"
+          TESTFLIGHT_TESTER_EMAIL: ${{ secrets.TESTFLIGHT_TESTER_EMAIL }}
+        run: node scripts/configure-testflight.mjs
